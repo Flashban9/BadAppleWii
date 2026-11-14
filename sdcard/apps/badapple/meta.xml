@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>BAD APPLE!!!</name>
+  <coder>Homebrew</coder>
+  <version>1.0</version>
+  <release_date>20261114000000</release_date>
+  <short_description>Wii Screensaver</short_description>
+  <long_description>Spielt Bad Apple!! in Endlosschleife mit Musik.
+Startet automatisch, HOME beendet die App.
+Benoetigt video.bin und audio.raw im selben Ordner.</long_description>
+</app>
