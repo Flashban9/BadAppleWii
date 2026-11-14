@@ -5,6 +5,7 @@
  * (Frames werden bei Bedarf uebersprungen, nie hinterherhinken).
  * HOME (Wiimote) / START (GC-Pad) / Reset: zurueck ins Wii-Menue. Power: ausschalten.
  * 1 + 2 + Pfeil oben: Umschalten Video <-> scrollende Code-Ansicht (Musik laeuft weiter).
+ * A: Anzeigemodus wechseln (16:9 gestreckt / Original 4:3 / 16:9 beschnitten).
  */
 #include <gccore.h>
 #include <wiiuse/wpad.h>
@@ -16,14 +17,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <malloc.h>
+#include <unistd.h>
 
 #include "decode.h"
 
 #define SRC_W_MAX   320
 #define SRC_H_MAX   240
 #define AUDIO_RATE  32000
-#define ABUF        8192        /* Bytes pro Audio-Puffer (2048 Sample-Frames = 64 ms) */
-#define NBUF        4
+#define ABUF        16384       /* Bytes pro Audio-Puffer (4096 Sample-Frames = 128 ms) */
+#define NBUF        8           /* ca. 1 Sekunde Vorrat -> Ruckler beim SD-Lesen werden abgefangen */
+#define SILENCE_LEN 1024        /* kurze Stille bei Notfall, damit die Luecke klein bleibt */
 
 #define COL_BLACK   0x10801080u
 #define COL_WHITE   0xEB80EB80u
@@ -51,7 +54,9 @@ static long vdata_start;
 
 /* Audio */
 static u8 abuf[NBUF][ABUF] ATTRIBUTE_ALIGN(32);
-static u8 silence[ABUF] ATTRIBUTE_ALIGN(32);
+static u8 silence[SILENCE_LEN] ATTRIBUTE_ALIGN(32);
+static lwp_t audio_thread;
+static volatile int audio_thread_run = 1;
 static volatile int a_state[NBUF];           /* 0 leer, 1 bereit, 2 spielt */
 static volatile u32 a_len[NBUF];
 static volatile int a_play = -1;
@@ -61,8 +66,15 @@ static volatile u64 a_done = 0;              /* abgespielte Sample-Frames (nur e
 static u64 loop_frames;                      /* Sample-Frames pro Durchlauf */
 
 /* Render */
+/* Anzeigemodi (Taste A wechselt):
+ *  0 = 16:9 Vollbild (Bild wird auf die ganze Flaeche gestreckt)
+ *  1 = Original 4:3 (am 16:9-Fernseher mit schwarzen Seitenbalken)
+ *  2 = 16:9 ohne Verzerrung (oben und unten wird etwas abgeschnitten) */
+#define N_MODES 3
+static int display_mode = 0;
 static u16 xmap[640];
-static int out_w, out_x_words, y_off;
+static u16 ymap[600];
+static int dst_w, dst_h, dst_x_words, dst_y;
 static u32 rowbuf[320] ATTRIBUTE_ALIGN(32);
 
 /* ---------- Callbacks ---------- */
@@ -82,7 +94,7 @@ static void dma_cb(void)
         AUDIO_InitDMA((u32)abuf[a_play], a_len[a_play]);
         a_next = (a_next + 1) % NBUF;
     } else {
-        AUDIO_InitDMA((u32)silence, ABUF);   /* Underrun: Stille, Uhr steht still */
+        AUDIO_InitDMA((u32)silence, SILENCE_LEN);   /* Underrun: Stille, Uhr steht still */
     }
     AUDIO_StartDMA();
 }
@@ -103,6 +115,17 @@ static void audio_refill(void)
         a_state[a_fill] = 1;
         a_fill = (a_fill + 1) % NBUF;
     }
+}
+
+/* Eigener Thread: liest Audio von der SD-Karte, unabhaengig vom Zeichnen des Videos */
+static void *audio_thread_func(void *arg)
+{
+    (void)arg;
+    while (audio_thread_run) {
+        audio_refill();
+        usleep(3000);
+    }
+    return NULL;
 }
 
 static u64 audio_position(void)
@@ -141,33 +164,55 @@ static int video_next(void)
 static void setup_geometry(void)
 {
     int wide = (CONF_GetAspectRatio() == CONF_ASPECT_16_9);
-    out_w = wide ? 480 : 640;                /* 4:3-Bild bleibt auch am 16:9-TV 4:3 */
-    out_x_words = ((rmode->fbWidth - out_w) / 2) / 2;
-    int out_h = vh * 2;
-    y_off = ((int)rmode->xfbHeight - out_h) / 2;
-    if (y_off < 0) y_off = 0;
-    for (int x = 0; x < out_w; x++)
-        xmap[x] = (u16)((x * vw) / out_w);
+    int fbw = rmode->fbWidth;
+    int full_h = rmode->xfbHeight;
+    int src_y0 = 0;
+    int src_rows = vh;
+
+    if (display_mode == 0) {                 /* Vollbild, gestreckt */
+        dst_w = fbw;
+        dst_h = full_h;
+    } else if (display_mode == 1) {          /* Original 4:3 */
+        dst_w = wide ? (fbw * 3) / 4 : fbw;
+        dst_h = full_h;
+    } else {                                 /* 16:9 ohne Verzerrung, oben/unten beschnitten */
+        dst_w = fbw;
+        dst_h = wide ? full_h : (full_h * 3) / 4;
+        src_rows = (vh * 3) / 4;
+        src_y0 = (vh - src_rows) / 2;
+    }
+    if (dst_w > 640) dst_w = 640;
+    if (dst_h > 600) dst_h = 600;
+    dst_w &= ~1;
+    dst_x_words = ((fbw - dst_w) / 2) / 2;
+    dst_y = (full_h - dst_h) / 2;
+    for (int x = 0; x < dst_w; x++)
+        xmap[x] = (u16)((x * vw) / dst_w);
+    for (int y = 0; y < dst_h; y++)
+        ymap[y] = (u16)(src_y0 + (y * src_rows) / dst_h);
 }
 
 static void render(void *fb)
 {
     u32 *dst = (u32 *)fb;
     int pitch = rmode->fbWidth / 2;          /* Woerter pro Zeile (2 Pixel pro Wort) */
-    int words = out_w / 2;
+    int words = dst_w / 2;
     size_t row_bytes = vw / 8;
+    int last_sy = -1;
 
-    for (u32 sy = 0; sy < vh; sy++) {
-        const u8 *row = frame_bits + sy * row_bytes;
-        for (int w = 0; w < words; w++) {
-            u32 x0 = xmap[2 * w], x1 = xmap[2 * w + 1];
-            u32 b0 = (row[x0 >> 3] >> (7 - (x0 & 7))) & 1;
-            u32 b1 = (row[x1 >> 3] >> (7 - (x1 & 7))) & 1;
-            rowbuf[w] = pair_col[(b0 << 1) | b1];
+    for (int y = 0; y < dst_h; y++) {
+        int sy = ymap[y];
+        if (sy != last_sy) {                 /* Zeile nur neu bauen, wenn sich die Quellzeile aendert */
+            const u8 *row = frame_bits + (size_t)sy * row_bytes;
+            for (int w = 0; w < words; w++) {
+                u32 x0 = xmap[2 * w], x1 = xmap[2 * w + 1];
+                u32 b0 = (row[x0 >> 3] >> (7 - (x0 & 7))) & 1;
+                u32 b1 = (row[x1 >> 3] >> (7 - (x1 & 7))) & 1;
+                rowbuf[w] = pair_col[(b0 << 1) | b1];
+            }
+            last_sy = sy;
         }
-        u32 *d0 = dst + (size_t)(y_off + 2 * sy) * pitch + out_x_words;
-        memcpy(d0, rowbuf, words * 4);
-        memcpy(d0 + pitch, rowbuf, words * 4);
+        memcpy(dst + (size_t)(dst_y + y) * pitch + dst_x_words, rowbuf, (size_t)words * 4);
     }
 }
 
@@ -327,6 +372,7 @@ static int open_files(const char *argv0)
         snprintf(p, sizeof(p), "%svideo.bin", dirs[i]);
         vfile = fopen(p, "rb");
         if (!vfile) continue;
+        setvbuf(vfile, NULL, _IOFBF, 32768);
         snprintf(p, sizeof(p), "%saudio.raw", dirs[i]);
         afile = fopen(p, "rb");
         if (afile) return 0;
@@ -392,6 +438,7 @@ int main(int argc, char **argv)
     audio_refill();
     AUDIO_RegisterDMACallback(dma_cb);
     dma_cb();
+    LWP_CreateThread(&audio_thread, audio_thread_func, NULL, NULL, 16384, 80);
 
     long cur_loop = 0;
     long cur_frame = -1;
@@ -401,8 +448,6 @@ int main(int argc, char **argv)
     const u32 combo_mask = WPAD_BUTTON_1 | WPAD_BUTTON_2 | WPAD_BUTTON_UP;
 
     while (!quit_flag) {
-        audio_refill();
-
         u64 pos = audio_position();
         long loop = (long)(pos / loop_frames);
         if (loop != cur_loop) {              /* Audio ist von vorn gestartet -> Video auch */
@@ -433,6 +478,14 @@ int main(int argc, char **argv)
         if ((WPAD_ButtonsDown(0) & WPAD_BUTTON_HOME) || (PAD_ButtonsDown(0) & PAD_BUTTON_START))
             quit_flag = 1;
 
+        if (!code_mode && (WPAD_ButtonsDown(0) & WPAD_BUTTON_A)) {
+            display_mode = (display_mode + 1) % N_MODES;
+            setup_geometry();
+            clear_fb(xfb[0]);
+            clear_fb(xfb[1]);
+            dirty = 1;
+        }
+
         int combo_now = (WPAD_ButtonsHeld(0) & combo_mask) == combo_mask;
         if (combo_now && !combo_prev) {
             if (code_mode) { show_video_mode(); dirty = 1; }
@@ -445,6 +498,8 @@ int main(int argc, char **argv)
         VIDEO_WaitVSync();
     }
 
+    audio_thread_run = 0;
+    LWP_JoinThread(audio_thread, NULL);
     AUDIO_StopDMA();
     AUDIO_RegisterDMACallback(NULL);
     fclose(vfile);
