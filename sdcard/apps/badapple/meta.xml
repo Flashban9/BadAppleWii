@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <app version="1">
   <name>BAD APPLE!!!</name>
-  <coder>Homebrew</coder>
+  <coder>Flashban9</coder>
   <version>1.0</version>
   <release_date>20261114000000</release_date>
-  <short_description>Wii Screensaver</short_description>
-  <long_description>Spielt Bad Apple!! in Endlosschleife mit Musik.
-Startet automatisch, HOME beendet die App.
-Benoetigt video.bin und audio.raw im selben Ordner.</long_description>
+  <short_description>Bad Apple now for the wii!!! created by Flashban9 :P</short_description>
+  <long_description>Bad Apple now for the wii!!! created by Flashban9 :P
+
+Press HOME to leave back to the Wii menu.
+Press A to change the aspect ratio.</long_description>
 </app>

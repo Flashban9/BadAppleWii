@@ -1,15 +1,16 @@
 /*
- * BAD APPLE!!! - Wii Screensaver
- * Spielt video.bin (1-Bit-Frames) + audio.raw (32 kHz, 16 Bit, Stereo, BE)
- * in Endlosschleife. Die Audio-Position ist die Master-Uhr, das Video folgt ihr
- * (Frames werden bei Bedarf uebersprungen, nie hinterherhinken).
- * HOME (Wiimote) / START (GC-Pad) / Reset: zurueck ins Wii-Menue. Power: ausschalten.
- * 1 + 2 + Pfeil oben: Umschalten Video <-> scrollende Code-Ansicht (Musik laeuft weiter).
- * A: Anzeigemodus wechseln (16:9 gestreckt / Original 4:3 / 16:9 beschnitten).
+ * BAD APPLE!!! for the Wii - created by Flashban9
+ * Plays video.bin (1-bit frames) + audio.raw (32 kHz, 16-bit, stereo, big endian)
+ * in an endless loop. The audio position is the master clock and the video follows it
+ * (frames are skipped when needed, so the picture never lags behind the music).
+ * HOME (Wiimote) / START (GC pad) / Reset: back to the Wii menu. Power: shut down.
+ * A: change the aspect ratio (16:9 stretched / original 4:3 / 16:9 cropped).
+ * (There is also a little easter egg. Find it. ;)
  */
 #include <gccore.h>
 #include <wiiuse/wpad.h>
-#include <ogc/audio.h>
+#include <asndlib.h>
+#include <ogc/lwp_watchdog.h>
 #include <ogc/conf.h>
 #include <ogc/machine/processor.h>
 #include <fat.h>
@@ -24,18 +25,17 @@
 #define SRC_W_MAX   320
 #define SRC_H_MAX   240
 #define AUDIO_RATE  32000
-#define ABUF        16384       /* Bytes pro Audio-Puffer (4096 Sample-Frames = 128 ms) */
-#define NBUF        8           /* ca. 1 Sekunde Vorrat -> Ruckler beim SD-Lesen werden abgefangen */
-#define SILENCE_LEN 1024        /* kurze Stille bei Notfall, damit die Luecke klein bleibt */
+#define ABUF        8192        /* bytes per audio buffer (2048 sample frames = 64 ms) */
+#define NBUF        8           /* about 0.5 s of queued audio to absorb SD card read hiccups */
 
 #define COL_BLACK   0x10801080u
 #define COL_WHITE   0xEB80EB80u
 
-/* Zwei Pixel pro Wort (Y0 Cb Y1 Cr); Index = (Bit links << 1) | Bit rechts */
+/* Two pixels per word (Y0 Cb Y1 Cr); index = (left bit << 1) | right bit */
 static const u32 pair_col[4] = {
     COL_BLACK,        /* 00 */
-    0x1080EB80u,   /* 01: schwarz, weiss */
-    0xEB801080u,   /* 10: weiss, schwarz */
+    0x1080EB80u,   /* 01: black, white */
+    0xEB801080u,   /* 10: white, black */
     COL_WHITE         /* 11 */
 };
 
@@ -48,28 +48,32 @@ static volatile int quit_flag = 0;
 static FILE *vfile, *afile;
 static u32 vw, vh, vfps, vframes;
 static size_t frame_bytes;
-static u8 *frame_bits;                       /* aktueller Bitmap-Frame */
+static u8 *frame_bits;                       /* current bitmap frame */
 static u8 vbuf[65536];
 static long vdata_start;
 
-/* Audio */
+/* Audio (streamed through ASND, fed by its own thread) */
 static u8 abuf[NBUF][ABUF] ATTRIBUTE_ALIGN(32);
-static u8 silence[SILENCE_LEN] ATTRIBUTE_ALIGN(32);
+static u32 a_len[NBUF];
+static int a_state[NBUF];                    /* 0 empty, 1 ready, 2 queued in ASND */
+static int a_fill = 0;                       /* next buffer to fill */
+static int a_sub = 0;                        /* next buffer to queue */
+static u32 a_sub_count = 0;                  /* number of buffers queued so far */
+static int a_started = 0;
 static lwp_t audio_thread;
 static volatile int audio_thread_run = 1;
-static volatile int a_state[NBUF];           /* 0 leer, 1 bereit, 2 spielt */
-static volatile u32 a_len[NBUF];
-static volatile int a_play = -1;
-static int a_next = 0;                       /* naechster zu startender Puffer (IRQ) */
-static int a_fill = 0;                       /* naechster zu fuellender Puffer (main) */
-static volatile u64 a_done = 0;              /* abgespielte Sample-Frames (nur echtes Audio) */
-static u64 loop_frames;                      /* Sample-Frames pro Durchlauf */
+/* Audio clock (written by the audio thread, read by the main loop) */
+static volatile u64 clk_done = 0;            /* frames of buffers that finished playing */
+static volatile u32 clk_cur = 0;             /* frames of the buffer that is playing now */
+static volatile u32 clk_next = 0;            /* frames of the waiting buffer (0 = none) */
+static volatile u64 clk_anchor = 0;          /* gettime() when the current buffer started */
+static u64 loop_frames;                      /* sample frames per loop */
 
 /* Render */
-/* Anzeigemodi (Taste A wechselt):
- *  0 = 16:9 Vollbild (Bild wird auf die ganze Flaeche gestreckt)
- *  1 = Original 4:3 (am 16:9-Fernseher mit schwarzen Seitenbalken)
- *  2 = 16:9 ohne Verzerrung (oben und unten wird etwas abgeschnitten) */
+/* Display modes (button A cycles through them):
+ *  0 = 16:9 fullscreen (picture is stretched over the whole screen)
+ *  1 = original 4:3 (black bars left and right on a 16:9 TV)
+ *  2 = 16:9 without distortion (a bit is cropped at the top and bottom) */
 #define N_MODES 3
 static int display_mode = 0;
 static u16 xmap[640];
@@ -81,31 +85,13 @@ static u32 rowbuf[320] ATTRIBUTE_ALIGN(32);
 static void on_reset(u32 irq, void *ctx) { (void)irq; (void)ctx; quit_flag = 1; }
 static void on_power(void) { quit_flag = 2; }
 
-static void dma_cb(void)
-{
-    if (a_play >= 0) {
-        a_done += a_len[a_play] / 4;
-        a_state[a_play] = 0;
-        a_play = -1;
-    }
-    if (a_state[a_next] == 1) {
-        a_play = a_next;
-        a_state[a_play] = 2;
-        AUDIO_InitDMA((u32)abuf[a_play], a_len[a_play]);
-        a_next = (a_next + 1) % NBUF;
-    } else {
-        AUDIO_InitDMA((u32)silence, SILENCE_LEN);   /* Underrun: Stille, Uhr steht still */
-    }
-    AUDIO_StartDMA();
-}
-
 static void audio_refill(void)
 {
     while (a_state[a_fill] == 0) {
         size_t n = fread(abuf[a_fill], 1, ABUF, afile);
         if (n == 0) { fseek(afile, 0, SEEK_SET); continue; }
         size_t len = n;
-        if (n < ABUF) {                       /* Dateiende: auf 32 Byte auffuellen, Schleife */
+        if (n < ABUF) {                       /* end of file: pad to 32 bytes, then loop */
             len = (n + 31) & ~(size_t)31;
             memset(abuf[a_fill] + n, 0, len - n);
             fseek(afile, 0, SEEK_SET);
@@ -117,13 +103,54 @@ static void audio_refill(void)
     }
 }
 
-/* Eigener Thread: liest Audio von der SD-Karte, unabhaengig vom Zeichnen des Videos */
+/* Queues ready buffers in ASND. ASND always holds one playing and one waiting buffer. */
+static void audio_feed(void)
+{
+    u32 level;
+    s32 st = ASND_StatusVoice(0);
+
+    if (a_state[a_sub] != 1) return;         /* nothing ready (underrun) */
+
+    if (!a_started || st == SND_UNUSED) {    /* start, or restart after an underrun */
+        u64 now = gettime();
+        _CPU_ISR_Disable(level);
+        clk_done += (u64)clk_cur + clk_next; /* everything queued so far has finished */
+        clk_cur = a_len[a_sub] / 4;
+        clk_next = 0;
+        clk_anchor = now;
+        _CPU_ISR_Restore(level);
+        ASND_SetVoice(0, VOICE_STEREO_16BIT, AUDIO_RATE, 0, abuf[a_sub], a_len[a_sub], 255, 255, NULL);
+        a_started = 1;
+    } else if (st == SND_WAITING) {
+        u64 now = gettime();
+        _CPU_ISR_Disable(level);
+        if (clk_next != 0) {                 /* the playing buffer ended, the next one is playing now */
+            clk_done += clk_cur;
+            clk_cur = clk_next;
+            clk_anchor = now;
+        }
+        clk_next = a_len[a_sub] / 4;
+        _CPU_ISR_Restore(level);
+        ASND_AddVoice(0, abuf[a_sub], a_len[a_sub]);
+    } else {
+        return;                              /* both slots are in use */
+    }
+
+    a_state[a_sub] = 2;
+    a_sub = (a_sub + 1) % NBUF;
+    a_sub_count++;
+    if (a_sub_count >= 4)                    /* only release buffers with a safety margin of extra buffers */
+        a_state[(a_sub_count - 4) % NBUF] = 0;
+}
+
+/* Own thread: reads audio from the SD card and feeds ASND, independent of drawing */
 static void *audio_thread_func(void *arg)
 {
     (void)arg;
     while (audio_thread_run) {
         audio_refill();
-        usleep(3000);
+        audio_feed();
+        usleep(2000);
     }
     return NULL;
 }
@@ -131,16 +158,18 @@ static void *audio_thread_func(void *arg)
 static u64 audio_position(void)
 {
     u32 level;
-    u64 pos;
+    u64 pos, anchor, done;
+    u32 cur;
     _CPU_ISR_Disable(level);
-    pos = a_done;
-    if (a_play >= 0) {
-        u32 left = AUDIO_GetDMABytesLeft();
-        u32 len = a_len[a_play];
-        if (left > len) left = len;
-        pos += (len - left) / 4;
-    }
+    done = clk_done;
+    cur = clk_cur;
+    anchor = clk_anchor;
     _CPU_ISR_Restore(level);
+    if (!a_started) return 0;
+    u64 us = ticks_to_microsecs(gettime() - anchor);
+    u64 frames = (us * AUDIO_RATE) / 1000000ULL;
+    if (frames > cur) frames = cur;          /* never beyond the end of the current buffer */
+    pos = done + frames;
     return pos;
 }
 
@@ -151,7 +180,7 @@ static void video_rewind(void)
     memset(frame_bits, 0, frame_bytes);
 }
 
-/* Dekodiert den naechsten Frame. 0 = ok, -1 = Fehler/Ende */
+/* Decodes the next frame. 0 = ok, -1 = error/end */
 static int video_next(void)
 {
     u8 l[2];
@@ -169,13 +198,13 @@ static void setup_geometry(void)
     int src_y0 = 0;
     int src_rows = vh;
 
-    if (display_mode == 0) {                 /* Vollbild, gestreckt */
+    if (display_mode == 0) {                 /* fullscreen, stretched */
         dst_w = fbw;
         dst_h = full_h;
-    } else if (display_mode == 1) {          /* Original 4:3 */
+    } else if (display_mode == 1) {          /* original 4:3 */
         dst_w = wide ? (fbw * 3) / 4 : fbw;
         dst_h = full_h;
-    } else {                                 /* 16:9 ohne Verzerrung, oben/unten beschnitten */
+    } else {                                 /* 16:9 without distortion, cropped top and bottom */
         dst_w = fbw;
         dst_h = wide ? full_h : (full_h * 3) / 4;
         src_rows = (vh * 3) / 4;
@@ -195,14 +224,14 @@ static void setup_geometry(void)
 static void render(void *fb)
 {
     u32 *dst = (u32 *)fb;
-    int pitch = rmode->fbWidth / 2;          /* Woerter pro Zeile (2 Pixel pro Wort) */
+    int pitch = rmode->fbWidth / 2;          /* words per line (2 pixels per word) */
     int words = dst_w / 2;
     size_t row_bytes = vw / 8;
     int last_sy = -1;
 
     for (int y = 0; y < dst_h; y++) {
         int sy = ymap[y];
-        if (sy != last_sy) {                 /* Zeile nur neu bauen, wenn sich die Quellzeile aendert */
+        if (sy != last_sy) {                 /* only rebuild the row when the source row changes */
             const u8 *row = frame_bits + (size_t)sy * row_bytes;
             for (int w = 0; w < words; w++) {
                 u32 x0 = xmap[2 * w], x1 = xmap[2 * w + 1];
@@ -223,7 +252,7 @@ static void clear_fb(void *fb)
     for (size_t i = 0; i < n; i++) p[i] = COL_BLACK;
 }
 
-/* ---------- Code-Ansicht ---------- */
+/* ---------- Easter egg: scrolling code view ---------- */
 static const char *code_lines[] = {
     "#include <stdio.h>",
     "#include <stdlib.h>",
@@ -327,18 +356,18 @@ static void show_video_mode(void)
 
 static void code_tick(void)
 {
-    /* meistens der Reihe nach, ab und zu ein Sprung -> wirkt wie "echtes" Scrollen */
+    /* mostly in order, now and then a jump -> looks like real scrolling */
     if (rand() % 12 == 0) code_line = rand() % N_CODE_LINES;
     else code_line = (code_line + 1) % N_CODE_LINES;
     printf("\x1b[32;1m%s\x1b[0m\n", code_lines[code_line]);
 }
 
-/* ---------- Start / Fehler ---------- */
+/* ---------- Startup / errors ---------- */
 static void fatal(const char *msg)
 {
     console_init(xfb[fb_idx], 20, 20, rmode->fbWidth, rmode->xfbHeight, rmode->fbWidth * VI_DISPLAY_PIX_SZ);
     VIDEO_ClearFrameBuffer(rmode, xfb[fb_idx], COLOR_BLACK);
-    printf("\x1b[2;0H\n  BAD APPLE!!!\n\n  %s\n\n  HOME = Beenden\n", msg);
+    printf("\x1b[2;0H\n  BAD APPLE!!!\n\n  %s\n\n  HOME = Exit\n", msg);
     VIDEO_SetNextFramebuffer(xfb[fb_idx]);
     VIDEO_Flush();
     while (!quit_flag) {
@@ -404,19 +433,19 @@ int main(int argc, char **argv)
     VIDEO_WaitVSync();
     if (rmode->viTVMode & VI_NON_INTERLACE) VIDEO_WaitVSync();
 
-    if (!fatInitDefault()) fatal("SD/USB konnte nicht gelesen werden.");
+    if (!fatInitDefault()) fatal("Could not read the SD card / USB drive.");
     if (open_files(argc > 0 ? argv[0] : NULL) != 0)
-        fatal("video.bin / audio.raw nicht gefunden.\n  Ordner: apps/badapple/ auf SD oder USB.");
+        fatal("video.bin / audio.raw not found.\n  Folder: apps/badapple/ on SD or USB.");
 
     u8 hdr[14];
     if (fread(hdr, 1, 14, vfile) != 14 || memcmp(hdr, "BAD1", 4) != 0)
-        fatal("video.bin ist ungueltig.");
+        fatal("video.bin is invalid.");
     vw = (hdr[4] << 8) | hdr[5];
     vh = (hdr[6] << 8) | hdr[7];
     vfps = (hdr[8] << 8) | hdr[9];
     vframes = ((u32)hdr[10] << 24) | (hdr[11] << 16) | (hdr[12] << 8) | hdr[13];
     if (vw > SRC_W_MAX || vh > SRC_H_MAX || (vw & 7) || vfps == 0 || vframes == 0)
-        fatal("video.bin hat ein unerwartetes Format.");
+        fatal("video.bin has an unexpected format.");
     vdata_start = ftell(vfile);
     frame_bytes = (size_t)vw * vh / 8;
     frame_bits = memalign(32, frame_bytes);
@@ -425,19 +454,15 @@ int main(int argc, char **argv)
     fseek(afile, 0, SEEK_END);
     long asize = ftell(afile);
     fseek(afile, 0, SEEK_SET);
-    if (asize < ABUF) fatal("audio.raw ist zu klein.");
+    if (asize < ABUF) fatal("audio.raw is too small.");
     loop_frames = (((u64)asize + 31) & ~(u64)31) / 4;
 
     setup_geometry();
 
-    /* Audio starten */
-    AUDIO_Init(NULL);
-    AUDIO_SetDSPSampleRate(AI_SAMPLERATE_32KHZ);
-    memset(silence, 0, sizeof(silence));
-    DCFlushRange(silence, sizeof(silence));
+    /* Start audio */
+    ASND_Init();
+    ASND_Pause(0);
     audio_refill();
-    AUDIO_RegisterDMACallback(dma_cb);
-    dma_cb();
     LWP_CreateThread(&audio_thread, audio_thread_func, NULL, NULL, 16384, 80);
 
     long cur_loop = 0;
@@ -450,7 +475,7 @@ int main(int argc, char **argv)
     while (!quit_flag) {
         u64 pos = audio_position();
         long loop = (long)(pos / loop_frames);
-        if (loop != cur_loop) {              /* Audio ist von vorn gestartet -> Video auch */
+        if (loop != cur_loop) {              /* audio started over -> video restarts too */
             cur_loop = loop;
             video_rewind();
             cur_frame = -1;
@@ -500,8 +525,9 @@ int main(int argc, char **argv)
 
     audio_thread_run = 0;
     LWP_JoinThread(audio_thread, NULL);
-    AUDIO_StopDMA();
-    AUDIO_RegisterDMACallback(NULL);
+    ASND_Pause(1);
+    ASND_StopVoice(0);
+    ASND_End();
     fclose(vfile);
     fclose(afile);
     VIDEO_SetBlack(TRUE);

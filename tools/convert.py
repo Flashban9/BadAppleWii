@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Konvertiert badapple.mov in die zwei Dateien, die die Wii-App braucht:
-  video.bin  - 1-Bit-Frames (XOR-Delta + Zero-Run-RLE)
-  audio.raw  - 32 kHz, 16 Bit, Stereo, Big Endian (Rohdaten fuer das AI-Interface)
-Aufruf: python3 convert.py badapple.mov ausgabeordner
-Benoetigt: ffmpeg, python3, numpy
+"""Converts a video (e.g. badapple.mov) into the two files the Wii app needs:
+  video.bin  - 1-bit frames (XOR delta + zero-run RLE)
+  audio.raw  - 32 kHz, 16-bit, stereo, big endian raw audio
+Usage: python3 convert.py badapple.mov output_folder
+Requires: ffmpeg, python3, numpy
 """
 import subprocess, struct, sys, os
 import numpy as np
@@ -13,7 +13,7 @@ THRESH = 128
 
 
 def encode_frame(bits, prev):
-    cur = np.packbits(bits.reshape(-1))  # W*H/8 Bytes, MSB zuerst
+    cur = np.packbits(bits.reshape(-1))  # W*H/8 bytes, MSB first
     delta = cur ^ prev
     d = delta.tolist()
     out = bytearray()
@@ -55,7 +55,7 @@ def main():
         f.write(b"BAD1" + struct.pack(">HHHI", W, H, FPS, len(frames)))
         for d in frames:
             f.write(struct.pack(">H", len(d)) + d)
-    print(f"{len(frames)} Frames, video.bin = {os.path.getsize(vpath)/1e6:.2f} MB")
+    print(f"{len(frames)} frames, video.bin = {os.path.getsize(vpath)/1e6:.2f} MB")
     apath = os.path.join(outdir, "audio.raw")
     subprocess.check_call(["ffmpeg", "-v", "error", "-y", "-i", src, "-vn",
                            "-ac", "2", "-ar", "32000", "-f", "s16be", apath])

@@ -1,6 +1,6 @@
 .SUFFIXES:
 ifeq ($(strip $(DEVKITPPC)),)
-$(error "DEVKITPPC ist nicht gesetzt. Beispiel: export DEVKITPPC=/opt/devkitpro/devkitPPC")
+$(error "DEVKITPPC is not set. Example: export DEVKITPPC=/opt/devkitpro/devkitPPC")
 endif
 include $(DEVKITPPC)/wii_rules
 
@@ -11,7 +11,7 @@ INCLUDES := source
 
 CFLAGS   = -g -O2 -Wall $(MACHDEP) $(INCLUDE)
 LDFLAGS  = -g $(MACHDEP) -Wl,-Map,$(notdir $@).map
-LIBS     := -lfat -lwiiuse -lbte -logc -lm
+LIBS     := -lasnd -lfat -lwiiuse -lbte -logc -lm
 LIBDIRS  := $(PORTLIBS)
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))

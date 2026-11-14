@@ -1,34 +1,46 @@
-# BAD APPLE!!! – Wii Screensaver
+# BAD APPLE!!! for the Wii
 
-Spielt Bad Apple!! in Endlosschleife mit Musik. Startet automatisch, HOME beendet.
+Bad Apple now for the wii!!! Created by Flashban9 :P
 
-## Bedienung
-- Start: Video und Musik laufen in Endlosschleife.
-- HOME (Wiimote) bzw. START (GameCube-Pad): zurueck ins Wii-Menue.
-- 1 + 2 + Pfeil oben gleichzeitig: Umschalten zwischen Video und scrollender Code-Ansicht
-  (die Musik laeuft weiter). Dieselbe Kombination schaltet zurueck.
+A Wii Homebrew Channel app that plays Bad Apple!! with music in an endless loop.
+It starts automatically, no menus.
 
-## Installation (wenn du die fertige boot.dol hast)
-Kopiere den Ordner `sdcard/apps/badapple/` nach `SD:/apps/badapple/`
-(Inhalt: boot.dol, meta.xml, icon.png, video.bin, audio.raw). Dann im Homebrew Channel starten.
+## Controls
+- **HOME** - leave back to the Wii menu
+- **A** - change the aspect ratio (16:9 stretched / original 4:3 / 16:9 cropped)
 
-## boot.dol bauen (einmalig)
-**Variante A – Docker (am einfachsten):**
+## Installation
+1. Copy the folder `apps/badapple/` to `SD:/apps/badapple/` (or `USB:/apps/badapple/`).
+   It must contain: `boot.dol`, `meta.xml`, `icon.png`, `video.bin`, `audio.raw`.
+2. Start the Homebrew Channel and launch **BAD APPLE!!!**.
+
+Tip: set your Wii to 16:9 in the Wii settings (Wii Options > Wii Settings > Screen > Widescreen Settings)
+to use the full widescreen picture.
+
+## Building boot.dol
+**Option A - GitHub Actions (no setup needed):** push/upload this repository to GitHub.
+The workflow in `.github/workflows/build.yml` builds `boot.dol`; download it from
+*Actions > latest run > Artifacts > boot-dol*.
+
+**Option B - Docker:**
+
     docker run --rm -v "$PWD":/project -w /project devkitpro/devkitppc make install
-**Variante B – GitHub:** Projekt in ein Repo hochladen, der Workflow `.github/workflows/build.yml`
-baut die boot.dol; unter "Actions -> Artifacts" die Datei `boot-dol` laden.
-**Variante C – devkitPro lokal:** devkitPPC + libogc installieren, dann `make install`.
 
-## Eigenes Video verwenden
-    python3 tools/convert.py meinvideo.mov sdcard/apps/badapple
-(braucht ffmpeg, python3, numpy). Format: 320x240, 30 fps, 1 Bit s/w; Audio 32 kHz Stereo.
+**Option C - local devkitPro:** install devkitPPC and libogc, then run `make install`.
 
-## Technik
-- Video: 1-Bit-Frames, XOR zum Vorgaenger + Zero-Run-RLE (9,7 MB fuer 6572 Frames)
-- Audio: Rohdaten per DMA-Doppelpuffer, die Audioposition ist die Uhr fuer das Video
-- Anzeige: 2x-Skalierung direkt in den XFB, bei 16:9-Wii bleibt das Bild 4:3
-- Schleife: Audio und Video starten gemeinsam neu
+## Using your own video
+    python3 tools/convert.py myvideo.mov sdcard/apps/badapple
 
-## Optional: eigener Wii-Menue-Channel
-Eine WAD braucht zusaetzliche Tools (z. B. einen Forwarder-Builder), die hier nicht dabei sind.
-Der Homebrew-Channel-Eintrag deckt "Eigener App-Eintrag" komplett ab.
+Requires ffmpeg, python3 and numpy. The converter creates `video.bin`
+(320x240, 30 fps, 1-bit, XOR delta + zero-run RLE) and `audio.raw`
+(32 kHz, 16-bit, stereo, big endian).
+
+## How it works
+- Video: 1-bit frames, XOR against the previous frame + zero-run RLE (about 9.7 MB for 6572 frames).
+- Audio: streamed through ASND by a separate thread, so drawing can never starve the sound.
+- Sync: the audio position is the master clock, the video follows it.
+- Display: scaled straight into the XFB; on a 16:9 Wii the 4:3 mode keeps the correct picture shape.
+- Loop: audio and video restart together.
+
+## Credits
+Player by Flashban9. Bad Apple!! and its shadow-art video belong to their original creators.

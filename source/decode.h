@@ -3,9 +3,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Dekodiert einen Frame (XOR-Delta + Zero-Run-RLE) auf den vorherigen Frame.
- * frame: Bitmap (w*h/8 Bytes), wird in-place aktualisiert.
- * Rueckgabe: 0 = ok, -1 = defekte Daten. */
+/* Decodes one frame (XOR delta + zero-run RLE) on top of the previous frame.
+ * frame: bitmap (w*h/8 bytes), updated in place.
+ * Returns: 0 = ok, -1 = corrupt data. */
 static inline int decode_frame(const uint8_t *src, size_t len, uint8_t *frame, size_t frame_bytes)
 {
     size_t i = 0, pos = 0;
@@ -18,7 +18,7 @@ static inline int decode_frame(const uint8_t *src, size_t len, uint8_t *frame, s
             if (i >= len) return -1;
             size_t run = src[i++];
             if (pos + run > frame_bytes) return -1;
-            pos += run;            /* Nullen: XOR veraendert nichts */
+            pos += run;            /* zeros: XOR changes nothing */
         }
     }
     return pos == frame_bytes ? 0 : -1;
