@@ -10,6 +10,7 @@
 #include <wiiuse/wpad.h>
 #include <ogc/audio.h>
 #include <ogc/conf.h>
+#include <ogc/machine/processor.h>
 #include <fat.h>
 #include <stdio.h>
 #include <stdlib.h>
