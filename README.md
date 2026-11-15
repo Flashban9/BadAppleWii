@@ -1,3 +1,8 @@
+Sound not working right now and the video is slowed down!
+I am trying to fix it in the next few days.
+
+
+
 # BAD APPLE!!! for the Wii
 
 Bad Apple now for the wii!!! Created by Flashban9 :P
